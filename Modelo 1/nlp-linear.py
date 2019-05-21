@@ -19,7 +19,10 @@ import numpy as np
 import pandas as pd
 import nltk
 from nltk.corpus import stopwords
-from scipy import sparse as sp_sparce
+from scipy import sparse as sp_sparse
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.linear_model import LogisticRegression
 
 
 def command_line_parser():
@@ -50,29 +53,39 @@ def command_line_parser():
 
 class Representation(object):
     def __init__(self, X_train, y_train):
-        pass
+        self.X_train = X_train
+        self.y_train = y_train
+
+    def calc_dataset_repr(self, dataset):
+        raise Exception("method not implemented")
+
+    def get_dictionary(self):
+        raise Exception("method not implemented")
 
 class BagOfWords(Representation):
     def __init__(self, X_train, y_train, dict_size = 5000):
+        super(BagOfWords, self).__init__(X_train, y_train)
+        
         self.objid  = id(self)
         self.logger = logging.getLogger('BagOfWords' + str(self.objid))
-
-        self.X_train = X_train
-        self.y_train = y_train
+        
         self.dict_size = dict_size
 
         tags_counts, words_counts = self.words_tags_count()
         self.calc_variables(tags_counts, words_counts)
 
     def calc_variables(self, tags_counts, words_counts):
-        most_common_tags = sorted(tags_counts.items(), key=lambda x: x[1], reverse=True)[:dict_size]
+        most_common_tags = sorted(tags_counts.items(), key=lambda x: x[1], reverse=True)[:self.dict_size]
         self.logger.debug("most common tags: %s", most_common_tags[:5])
-        most_common_words = sorted(words_counts.items(), key=lambda x: x[1], reverse=True)[:dict_size]
+        most_common_words = sorted(words_counts.items(), key=lambda x: x[1], reverse=True)[:self.dict_size]
         self.logger.debug("most common words: %s", most_common_words[:5])
         self.WORDS_TO_INDEX = {key[0]:idx for idx,key in enumerate(most_common_words)}
         self.INDEX_TO_WORDS = [word[0] for word in most_common_words]
         self.ALL_WORDS = self.WORDS_TO_INDEX.keys()
 
+    def get_dictionary(self):
+        return self.ALL_WORDS
+        
     def words_tags_count(self):
         tags_counts = {}
         words_counts = {}
@@ -104,13 +117,44 @@ class BagOfWords(Representation):
     
         return result_vector
 
-    def calc_bow_dataset(self, dataset):
-        return sp_sparse.vstack([sp_sparse.csr_matrix(my_bag_of_words(text)) \
+    def calc_dataset_repr(self, dataset):
+        return sp_sparse.vstack([sp_sparse.csr_matrix(self.calc_bow(text)) \
                                  for text in dataset])
 
 class TFIDF(Representation):
-    def __init__(self):
-        pass
+    def __init__(self, X_train, y_train, ngram_range=(1,2), max_df=0.9, min_df=5):
+        super(TFIDF, self).__init__(X_train, y_train)
+
+        self.objid  = id(self)
+        self.logger = logging.getLogger('TFIDF' + str(self.objid))
+
+        self.logger.debug("Constructor parameters:", "\n\t".join(
+            zip(
+                ["ngram_range", "max_df", "min_df"],
+                [ngram_range, max_df, min_df],
+            )))
+        
+        self.ngram_range = ngram_range
+        self.max_df = max_df
+        self.min_df = min_df
+
+        self.tfidf_vectorizer = TfidfVectorizer(input='content', 
+                                                lowercase=True,
+                                                ngram_range=self.ngram_range,
+                                                max_df=self.max_df,
+                                                min_df=self.min_df,
+                                                token_pattern='(\S+)')
+
+        self.logger.debug("Fitting training data to TFIDF vectorizer")
+        self.tfidf_vectorizer.fit(self.X_train)
+        self.INDEX_TO_WORDS = {i:word for word,i in self.tfidf_vectorizer.vocabulary_.items()}
+
+    def get_dictionary(self):
+        return self.tfidf_vectorizer.vocabulary_
+        
+    def calc_dataset_repr(self, dataset):
+        return self.tfidf_vectorizer.transform(dataset, copy=True)
+        
 
 class NLPLinearMod(object):
     def __init__(self):
@@ -173,14 +217,54 @@ class NLPLinearMod(object):
         data = pd.DataFrame.from_dict(d)
         return data
         
-    def trainModel(self, stream, inputtag, predicttag):
+    def trainModel(self, stream, inputtag, predicttag, representation, logits=None):
+        assert issubclass(representation, Representation)
+        
         train = self.read_data(stream, inputtag, predicttag, filter=True)
         X_train, y_train = train[inputtag].to_numpy(), train[predicttag].to_numpy()
         
         self.logger.debug("%s\n\n%s", X_train, y_train)
-        self.logger.debug(X_train.shape, y_train.shape)
+        self.logger.debug("%s, %s", X_train.shape, y_train.shape)
 
+        self.logger.debug("Calculating representation with: (%s)", representation)
+        self.repr = representation(X_train, y_train)
+        dataset_repr = self.repr.calc_dataset_repr(X_train)
+
+        self.logger.debug("Adapting prediction tags \"%s\" to MultiLabelBinarizer", predicttag)
+        self.multi_label_binarizer = MultiLabelBinarizer(classes=list(set(y_train.tolist())))
+        y_train = self.multi_label_binarizer.fit_transform(y_train)
+
+        self.logger.debug("Training classifier ...")
+        self.classifier = self.train_classifier(X_train, y_train, logits=logits)
         
+        return X_train, y_train, self.classifier
+
+    def train_classifier(self, X_train, y_train, logits=None, max_iterations=1000):
+        """
+        X_train, y_train = training data
+        logits           = LogisticRegression with hyperparameters defined, None to use default settings
+        max_iterations   = maximum number of iterations for the OvR classifier to converge
+        
+        return: trained classifier
+        """
+    
+        # Create and fit LogisticRegression wraped into OneVsRestClassifier.
+        logits = LogisticRegression(solver='liblinear',
+                                    multi_class='ovr',
+                                    max_iter=max_iterations) if logits is None \
+                                    else logits
+        ovr = OneVsRestClassifier(logits, n_jobs=-1) # njobs = -1 for parallel computing
+        ovr.fit(X_train, y_train)
+    
+        return ovr
+
+    def predict(self, testset):
+        ts_repr = self.repr.calc_dataset_repr(testset)
+        return self.classifier.predict(ts_repr)
+
+    def reverse_tags_repr(self, y_predicted):
+        return self.multi_label_binarizer.inverse_transform(y_predicted)
+
     
 def main():
     options = command_line_parser()
@@ -206,7 +290,15 @@ def main():
     streamit = DictStreamIteratorJson(inputfile)
     
     model = NLPLinearMod()
-    model.trainModel(streamit, options.data_tag, options.prediction_tag)
+    X, y, _ = model.trainModel(streamit, options.data_tag, options.prediction_tag, BagOfWords)
+    y_pred = model.predict(X)
+
+    y_r, y_pred_r = model.reverse_tags_repr(y), model.reverse_tags_repr(y_pred)
+
+    print("Real\tPredicted")
+    for real, pred in zip(y_r, y_pred_r):
+        print("%s\t%s" % (real, pred))
+    
 
     inputfile.close()
     outputfile.close()
