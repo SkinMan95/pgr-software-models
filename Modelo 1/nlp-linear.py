@@ -48,6 +48,70 @@ def command_line_parser():
 
     return args
 
+class Representation(object):
+    def __init__(self, X_train, y_train):
+        pass
+
+class BagOfWords(Representation):
+    def __init__(self, X_train, y_train, dict_size = 5000):
+        self.objid  = id(self)
+        self.logger = logging.getLogger('BagOfWords' + str(self.objid))
+
+        self.X_train = X_train
+        self.y_train = y_train
+        self.dict_size = dict_size
+
+        tags_counts, words_counts = self.words_tags_count()
+        self.calc_variables(tags_counts, words_counts)
+
+    def calc_variables(self, tags_counts, words_counts):
+        most_common_tags = sorted(tags_counts.items(), key=lambda x: x[1], reverse=True)[:dict_size]
+        self.logger.debug("most common tags: %s", most_common_tags[:5])
+        most_common_words = sorted(words_counts.items(), key=lambda x: x[1], reverse=True)[:dict_size]
+        self.logger.debug("most common words: %s", most_common_words[:5])
+        self.WORDS_TO_INDEX = {key[0]:idx for idx,key in enumerate(most_common_words)}
+        self.INDEX_TO_WORDS = [word[0] for word in most_common_words]
+        self.ALL_WORDS = self.WORDS_TO_INDEX.keys()
+
+    def words_tags_count(self):
+        tags_counts = {}
+        words_counts = {}
+
+        for line in self.X_train:
+            for word in line.split():
+                t = word.strip()
+                words_counts[t] = words_counts.get(t, 0) +1
+        
+        for tags in self.y_train:
+            for tag in tags:
+                t = tag.strip()
+                tags_counts[t] = tags_counts.get(t, 0) +1
+
+        return (words_counts, tags_counts)
+
+    def calc_bow(self, text):
+        """
+        text: a string
+        
+        return a vector which is a bag-of-words representation of 'text'
+        """
+        result_vector = np.zeros(self.dict_size)
+        keys = self.WORDS_TO_INDEX.keys()
+    
+        for word in text.split():
+            if word in keys:
+                result_vector[self.WORDS_TO_INDEX[word]] += 1
+    
+        return result_vector
+
+    def calc_bow_dataset(self, dataset):
+        return sp_sparse.vstack([sp_sparse.csr_matrix(my_bag_of_words(text)) \
+                                 for text in dataset])
+
+class TFIDF(Representation):
+    def __init__(self):
+        pass
+
 class NLPLinearMod(object):
     def __init__(self):
         self.objid  = id(self)
@@ -114,7 +178,9 @@ class NLPLinearMod(object):
         X_train, y_train = train[inputtag].to_numpy(), train[predicttag].to_numpy()
         
         self.logger.debug("%s\n\n%s", X_train, y_train)
-        print(X_train.shape, y_train.shape)
+        self.logger.debug(X_train.shape, y_train.shape)
+
+        
     
 def main():
     options = command_line_parser()
